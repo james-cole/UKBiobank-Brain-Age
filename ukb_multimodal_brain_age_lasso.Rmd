@@ -1,0 +1,783 @@
+---
+title: "UK Biobank Multi-modality Brain Age LASSO regression analysis"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+output: html_document
+---
+
+Analysis of the UK Biobank neuroimaging data to build a model of brain ageing using multiple neuroimaging modalities. James Cole, 2nd October 2019
+
+### Set up working directory, data and libraries
+The data were initially read using Ken Hanscombe's ukbtools package (ukb_df tool), which reads the .tab file, .r script and .html.
+This is slow process for large files, hence here the data are read and than saved as .rda files, which can be loaded more swiftly for convenience.
+
+```{r setup, include=FALSE, cache = FALSE}
+require("knitr")
+## setting working directory
+opts_knit$set(root.dir = "/Users/jcole/Work/Brain ageing/UK Biobank/analysis/UKBiobank-Brain-Age")
+```
+
+```{r message=FALSE, warning=FALSE}
+# clear workspace
+rm(list = ls())
+# Load packages
+library(boot)
+library(corrplot)
+library(cowplot)
+library(dplyr)
+library(ggplot2)
+library(glmnet)
+library(heplots)
+library(hier.part)
+library(Hmisc)
+library(kableExtra)
+library(knitr)
+library(lm.beta)
+library(psych)
+library(pwr)
+library(tidyverse)
+library(ukbtools)
+```
+### Load downloaded data files, and merge
+Looks for existing file and loads is available.
+```{r}
+if (file.exists("../ukb_data.rda")) {
+  cat("Loading data file", date(),sep = " ")
+  load(file = "../ukb_data.rda")
+  } else {
+    tmp <- ukb_df("ukb23892", path = "/Volumes/home/analysis/UKBiobank/ID_23892")
+    tmp1 <- ukb_df("ukb26571", path = "/Volumes/home/analysis/UKBiobank/ID_26571")
+    tmp2 <- read.table("../rs_fMRI_data.txt", colClasses = c("eid" = "character"))
+    df <- list(tmp, tmp1, tmp2) %>% reduce(left_join, by = "eid") # using purr
+    save(df, file = "../ukb_data.rda")
+    rm(list = ls(pattern = "tmp*"))
+  }
+```
+
+Data from n = `r dim(df)[1]` UK Biobank participants were downloaded for the study. 
+
+### Subset to include those with scans only
+Field 12188 uses coding 0=no, 1=yes, -1=unknown.
+Subset to only include those who completed brain MRI from imaging assessment.
+```{r}
+df$brain_mri_measurement_completeduses_datacoding_21_f12188_2_0 <- as.factor(df$brain_mri_measurement_completeduses_datacoding_21_f12188_2_0)
+table(df$brain_mri_measurement_completeduses_datacoding_21_f12188_2_0)
+df <- subset(df, df$brain_mri_measurement_completeduses_datacoding_21_f12188_2_0 == 1)
+```
+
+### Reformat age (numeric) and sex (factor) variables
+```{r}
+df[,grep("age_when_attended", names(df))] <- lapply(df[,grep("age_when_attended", names(df))], as.numeric)
+df$sex <- factor(df$sexuses_datacoding_9_f31_0_0)
+df$sex <- dplyr::recode(df$sex, "0" = "Female", "1" = "Male")
+df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0 <-  factor(df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0)
+df$stroke_history <- factor(!is.na(df$age_stroke_diagnoseduses_datacoding_100291_f4056_2_0) & as.numeric(df$age_stroke_diagnoseduses_datacoding_100291_f4056_2_0) > 0, labels = c("no stroke", "stroke"))
+
+var.list <- c("body_mass_index_bmi_f21001_2_0",
+              "diastolic_blood_pressure_automated_reading_f4079_2_0",
+              "diastolic_blood_pressure_automated_reading_f4079_2_1",
+              "systolic_blood_pressure_automated_reading_f4080_2_0",
+              "systolic_blood_pressure_automated_reading_f4080_2_1",
+              "hip_circumference_f49_2_0",
+              "weight_f21002_2_0",
+              "hand_grip_strength_left_f46_2_0",
+              "hand_grip_strength_right_f47_2_0",
+              "overall_health_ratinguses_datacoding_100508_f2178_2_0",
+              "longstanding_illness_disability_or_infirmityuses_datacoding_100349_f2188_2_0",
+              "height_f12144_2_0",
+              "mean_tfmri_head_motion_averaged_across_space_and_time_points_f25742_2_0",
+              "mean_rfmri_head_motion_averaged_across_space_and_time_points_f25741_2_0",
+              "volumetric_scaling_from_t1_head_image_to_standard_space_f25000_2_0",
+              "fluid_intelligence_score_f20016_2_0",
+              "duration_to_complete_numeric_path_trail_1uses_datacoding_1990_f6348_2_0",
+              "duration_to_complete_alphanumeric_path_trail_2uses_datacoding_1990_f6350_2_0",
+              "number_of_puzzles_correctly_solved_f6373_2_0",
+              "duration_spent_answering_each_puzzle_f6333_2_0",
+              "number_of_puzzles_correct_f6382_2_0",
+              "duration_of_moderate_activityuses_datacoding_100291_f894_2_0",
+              "duration_of_vigorous_activityuses_datacoding_100291_f914_2_0")
+
+df[,var.list] <- lapply(df[,var.list], as.numeric)
+```
+
+### Make list of imaging variables and recode variables to numeric
+```{r}
+imaging.vars.list <- grep("forced|nifti|discrepancy", grep("volume|t2star|t2_flair|bold|activation|skeleton|tract|Partial_corr_25_dim", names(df), value = T), invert = T, value = T)
+df[,grep("volume", names(df))] <- lapply(df[,grep("volume", names(df))], as.numeric)
+df[,grep("t2star", names(df))] <- lapply(df[,grep("t2star", names(df))], as.numeric)
+df[,grep("t2_flair", names(df))] <- lapply(df[,grep("t2_flair", names(df))], as.numeric)
+df[,grep("bold", names(df))] <- lapply(df[,grep("bold", names(df))], as.numeric)
+df[,grep("skeleton", names(df))] <- lapply(df[,grep("skeleton", names(df))], as.numeric)
+df[,grep("tract", names(df))] <- lapply(df[,grep("tract", names(df))], as.numeric)
+df[,grep("activation", names(df))] <- lapply(df[,grep("activation", names(df))], as.numeric)
+write.csv(file = "ukb_imaging_vars_list.csv", x = imaging.vars.list, quote = F, row.names = F,col.names = F)
+```
+
+### The UK Biobank imaging visit is instance 2
+Instance 0 is the baseline demographic clinical visit from 2006-2010. Instance 1 is a follow-up from 2012, no imaging then.
+Exclude people without complete imaging data.
+```{r paged.print=FALSE}
+table(complete.cases(df[,c(imaging.vars.list)]))
+df <- df[complete.cases(df[,c(imaging.vars.list)]),]
+df$age_at_scan <- df$age_when_attended_assessment_centre_f21003_2_0
+describe(df$age_at_scan)
+table(df$sex)
+```
+```{r}
+hist(df$age_at_scan, breaks = 25, col = "darkgoldenrod2", xlab = 'Age at scan (years)')
+```
+
+# Analysis
+## Set up data
+### Select only healthy participants
+Function to generate a data.frame with TRUE or FALSE for the presence/absence of ICD diagnosis. Adapted from Ken's ukb_icd_diagnosis() function.
+```{r}
+has_icd.diagnosis <- function(id, icd.version){
+  x <- df %>% dplyr::filter(eid %in% id) %>% 
+  dplyr::select(matches(paste("^diagnoses.*icd", icd.version, sep = ""))) %>% 
+  dplyr::select_if(colSums(!is.na(.)) > 0) %>% ncol() != 0
+  return(data.frame(id, x))
+}
+```
+
+### Compute ICD diagnosis data
+Running on the whole dataset takes >4 hours for n>20,000. So load .RDA file if avaialble.
+```{r}
+if (file.exists("../ukb_icd.diagnosis_data.rda")) {
+  load("../ukb_icd.diagnosis_data.rda")
+  } else {
+    has_icd.diagnosis.df <- do.call(rbind, lapply(df$eid, function(x) has_icd.diagnosis(x, 10)))
+    save(has_icd.diagnosis.df, file = "../ukb_icd.diagnosis_data.rda")
+  }
+```
+
+Merge to add health status variable.
+```{r}
+names(has_icd.diagnosis.df) <- c("eid", "icd_positive")
+df <- merge(df, has_icd.diagnosis.df)
+table(df$icd_positive)
+```
+
+Check number of ICD-positive against subjective health and longstanding illness.
+```{r}
+table(df$overall_health_ratinguses_datacoding_100508_f2178_2_0, df$icd_positive)
+table(df$longstanding_illness_disability_or_infirmityuses_datacoding_100349_f2188_2_0, df$icd_positive)
+```
+
+### Make data.frame of healthy people only
+Include people with no ICD-10 diagnosis, no self-reported long-standing illness disability or infirmity (F2188) and good or excellent self-reported health (F2178).
+Remove subjects with NAs in the age column and with the missing imaging variables.
+```{r paged.print=FALSE}
+df$healthy <- ifelse(df$icd_positive == "FALSE" & df$longstanding_illness_disability_or_infirmityuses_datacoding_100349_f2188_2_0 == 0 & df$overall_health_ratinguses_datacoding_100508_f2178_2_0 >= 2 & df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0 == 0 & df$stroke_history != "stroke", "healthy", "non-healthy")
+healthy.df <- subset(df, df$healthy == "healthy")
+table(is.na(df$healthy))
+```
+
+### Descriptive statistics of healthy vs. non-healthy
+Run descriptive statistics
+```{r paged.print=FALSE}
+describeBy(df$age_at_scan, df$healthy)
+table(df$sex, df$healthy)
+round(prop.table(table(df$sex, df$healthy), 2),3)
+```
+
+```{r}
+ggplot(subset(df, !is.na(df$healthy)), aes(age_at_scan, color = healthy)) +
+  geom_density(aes(fill = healthy), alpha = 0.5) +
+  xlab("Age at MRI scan (years)") +
+  theme_bw() 
+```
+
+#### Ethnic background
+Lots of missing data here, around 50% NAs
+Coding here: http://biobank.ctsu.ox.ac.uk/crystal/coding.cgi?id=1001
+```{r}
+table(is.na(df$ethnic_backgrounduses_datacoding_1001_f21000_2_0))
+table(df$ethnic_backgrounduses_datacoding_1001_f21000_2_0, df$healthy)
+round(100*prop.table(table(df$ethnic_backgrounduses_datacoding_1001_f21000_2_0, df$healthy), 2),2)
+```
+
+#### Anthropometrics
+BMI
+```{r paged.print=FALSE}
+by(df$body_mass_index_bmi_f21001_2_0, df$healthy, function(x) describe(x, quant = c(.25,.75), na.rm = T))
+```
+
+Weight
+```{r paged.print=FALSE}
+by(df$weight_f21002_2_0, df$healthy, function(x) describe(x, quant = c(.25,.75), na.rm = T))
+```
+
+Hip circumference
+```{r paged.print=FALSE}
+by(df$hip_circumference_f49_2_0, df$healthy, function(x) describe(x, quant = c(.25,.75), na.rm = T))
+```
+
+#### Blood pressure
+```{r paged.print=FALSE}
+print("Diastolic")
+by(df$diastolic_blood_pressure_automated_reading_f4079_2_0, df$healthy, function(x) describe(x, quant = c(.25,.75), na.rm = T))
+print("Systolic")
+by(df$systolic_blood_pressure_automated_reading_f4080_2_0, df$healthy, function(x) describe(x, quant = c(.25,.75), na.rm = T))
+```
+
+#### Diabetes
+```{r paged.print=FALSE}
+table(df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0, df$healthy)
+round(100*prop.table(table(df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0, df$healthy), 2),2)
+```
+
+#### Stroke
+```{r paged.print=FALSE}
+table(df$stroke_history, df$healthy)
+round(100*prop.table(table(df$stroke_history, df$healthy), 2),2)
+```
+
+### Designate subset as training and validation/model testing
+Use 80% for training and 20% for validation/testing.
+```{r}
+# Determine sample size and assign training/test group variables
+set.seed(1982)
+index <- sample(2, nrow(healthy.df), replace = TRUE, prob = c(0.8, 0.2))
+table(index)
+# Split data into training/testing and keep imaging variables only
+train_data <- healthy.df[index == 1, imaging.vars.list]
+test_data <- healthy.df[index == 2,  imaging.vars.list]
+# Define objects with age labels for training and test sets
+train_labels <- healthy.df[index == 1, "age_at_scan"]
+test_labels <- healthy.df[index == 2, "age_at_scan"]
+```
+
+#### Check the age distribution between training and test
+```{r paged.print=FALSE}
+describe(train_labels)
+describe(test_labels)
+```
+```{r}
+par(mfrow = c(1,2))
+hist(train_labels, breaks = 20, col = "darkgoldenrod2", main = "Training set age", xlab = "Age at scan (years)")
+hist(test_labels, breaks = 20, col = "darkgoldenrod2", main = "Validation set age", xlab = "Age at scan (years)")
+par(mfrow = c(1,1))
+```
+
+### Scale variables
+This is essential for ANN and probably a good idea for all the models.
+
+#### Important, need to apply scaling parameters to new data
+```{r}
+scaled.train_data <- scale(train_data, scale = TRUE, center = TRUE)
+scaling.parameters.center <- attr(scaled.train_data, "scaled:center")
+scaling.parameters.scale <- attr(scaled.train_data, "scaled:scale")
+scaled.test_data <- as.data.frame(scale(test_data, scaling.parameters.center, scaling.parameters.scale))
+scaled.train_data <- as.data.frame(scaled.train_data)
+```
+
+### Univariate correlations with age
+Plot of n=`r length(imaging.vars.list)` variables using the index order (which is basically arbitrary).
+With n = 2725, very small r values will be significant at 0.05.
+Bonferroni adjusted pvalues need to be below 0.05/1079 = `r 0.05/length(imaging.vars.list)`.
+```{r}
+alpha <- 0.05
+power <- pwr.r.test(n = length(healthy.df$age_at_scan), sig.level = alpha, power = 0.8, alternative = "greater")
+power.bonf <- pwr.r.test(n = length(healthy.df$age_at_scan), sig.level = alpha/length(imaging.vars.list), power = 0.8, alternative = "greater")
+plot(sapply(healthy.df[imaging.vars.list], function(x) cor(x, healthy.df$age_at_scan)), 
+     type = "h", 
+     col = "darkgoldenrod2",
+     ylab = "Pearson's r with age");abline(h = 0);abline(h = power$r, lty = "dashed", col = "grey40");abline(h = (0 - power$r), lty = "dashed", col = "grey40"); abline(h = power.bonf$r, col = "darkred", lty = 2); abline(h = (0 - power.bonf$r), col = "darkred", lty = 2)
+text(x = 0, y = 0.065, "Uncorrected p = 0.05", col = "grey40", adj = 0, cex = 0.8)
+text(x = 0, y = 0.13, "Bonferroni p = 0.05", col = "darkred", adj = 0, cex = 0.8)
+```
+
+Of the univariate correlations with age, `r table(sapply(healthy.df[imaging.vars.list], function(x) cor.test(x, healthy.df$age_at_scan)$p.value) < 0.05)[2]` are significant at p = 0.05.
+When using Bonferroni correction `r table(p.adjust(sapply(healthy.df[imaging.vars.list], function(x) cor.test(x, healthy.df$age_at_scan)$p.value), method = "bonf") < 0.05)[2]` are significant at p = 0.05.
+
+### Functions to output accuracy metrics and plot age by predicted age.
+Take predicted age values as input.
+```{r}
+test_results <- function(pred) {
+  r <- cor.test(test_labels, pred)$estimate
+  r.sq <- summary(lm(test_labels ~ pred))$r.squared
+  MAE <- mean(abs(pred - test_labels), na.rm = T)
+  age.bias <- cor.test(test_labels, (pred - test_labels))$estimate
+  value <- sapply(c(r,r.sq, MAE, age.bias), function(x) round(x, 3))
+  results <- cbind(c("r", "R^2", "MAE", "Age.bias"), value)
+  return(kable(results) %>% kable_styling())
+}
+
+age_plot <- function(pred) {
+  qplot(x = test_labels, y = pred) +
+    geom_abline(slope = 1, intercept = 0) +
+    geom_point(shape = 21, bg = "darkgoldenrod2", size = 2) +
+    geom_smooth(method = "lm", col = "darkgrey") +
+    xlab("Age (years)") +
+    ylab(deparse(substitute(pred))) +
+    theme_bw()
+  }
+```
+
+## LASSO regression
+Using the glmnet package. Alpha = 1 is for LASSO penalisation (0 = ridge, 0.5 = elastic net).
+```{r}
+x.train <- as.matrix(scaled.train_data)
+dimnames(x.train) <- NULL
+y.train <- as.matrix(train_labels)
+## cross-validation for lambda
+lasso.fit.cv <- cv.glmnet(x = x.train, y = y.train,
+                          alpha = 1, family = "gaussian")
+```
+
+Plot results. The minimum lambda value is `r round(lasso.fit.cv$lambda.min,3)`, while the optimal lambda value (i.e., the highest value within 1 standard error of the minimum) is `r round(lasso.fit.cv$lambda.1se,3)`.
+```{r}
+plot(lasso.fit.cv)
+```
+
+### LASSO model performance on test data
+```{r}
+## fit model using optimal lambda value (1 SE value, not minimum)
+lasso.fit <- glmnet(x = x.train, y = y.train,
+                    alpha = 1, family = "gaussian", lambda = lasso.fit.cv$lambda.1se)
+lasso.pred <- predict(lasso.fit, newx = as.matrix(scaled.test_data))
+test_results(lasso.pred)
+```
+```{r}
+age_plot(lasso.pred)
+ggsave("~/Work/Articles/Brain age/UK Biobank multi-modal brain age/brain_age_scatterplot.pdf", useDingbats = FALSE, dpi = 75, height = 4, width = 4)
+```
+
+### Variable weightings and feature selection results
+```{r}
+LASSO.coefficient <- coef(lasso.fit, s = lasso.fit.cv$lambda.1se)[-1]
+var.coefs <- data.frame(imaging.vars.list, LASSO.coefficient)
+non.zero_vars <- subset(var.coefs, var.coefs$LASSO.coefficient != 0)
+non.zero_vars$imaging.vars.list <- factor(non.zero_vars$imaging.vars.list)
+```
+Out of the original `r dim(var.coefs)[1]` variables, the LASSO regression set `r length(non.zero_vars$imaging.vars.list)` to non-zero, thus `r dim(var.coefs)[1] - length(non.zero_vars$imaging.vars.list)` variables were removed.
+
+## Bootstrap LASSO
+Bootstrap 95% confidence intervals. Uses the boot package.
+
+#### Function to obtain LASSO regression coefficients
+Essential to convert coefficients to vector that stores zeros.
+```{r}
+lasso.coef <- function(data, indices) {
+  d <- data[indices,]
+  fit <- glmnet(x = d[,-1], y = d[,1],
+                    alpha = 1, family = "gaussian", lambda = lasso.fit.cv$lambda.1se)
+  return(coef(fit)[,1])
+}
+```
+
+#### Run bootstrap with n replications
+Normal printing and plotting of results doesn't work for high-dimensional datasets.
+Load data file if it already exists.
+```{r}
+if (file.exists("../lasso.boot.out.rda")) {
+  load("../lasso.boot.out.rda")
+  } else {
+    cat("running bootstraps")
+    boot.out <- boot(data = cbind(y.train, x.train), statistic = lasso.coef, R = 1000)
+    save(boot.out, file = "../lasso.boot.out.rda")
+  }
+```
+There were `r table(boot.out$t0[-1] > 0 | boot.out$t0[-1] < 0)[2]` non-zero coefficients.
+
+Check histogram of bootstrap coefficients for top variable by way of example.
+```{r}
+hist(boot.out$t[,which.max(abs(boot.out$t0[-1])) + 1], breaks = 100, col = "darkgoldenrod2")
+```
+
+#### Function for getting CIs from vector
+```{r}
+ci.vector <- function(index, boot.object, ci.type) {
+  x <- boot.ci(boot.object, type = ci.type, index = index)
+  return(x[4])
+}
+```
+
+Use my ci.vector() function (defined above) to derive confidence intervals. 
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+n <- length(boot.out$t0)
+boot.ci.out <- sapply(1:n, ci.vector, boot.object = boot.out, ci.type = "basic")
+x <- boot.out$t0[1:n]
+y <- data.frame(t(matrix(unlist(boot.ci.out), ncol = n)))[4:5]
+ci.df <- cbind(x, y)
+names(ci.df) <- c("coef", "l.ci", "u.ci")
+```
+
+Identify variables with confidence intervals that do not overlap zero.
+```{r paged.print=FALSE}
+# drop intercept from plot using [-1] in vector ci.df$l.ci and ci.df$u.ci (i.e., the intercept is the top row)
+sig.vars.index <- which(ci.df$l.ci[-1] > 0 | ci.df$u.ci[-1] < 0)
+sig.vars.list <- imaging.vars.list[sig.vars.index]
+sig.vars.df <- ci.df[sig.vars.index + 1,] ## add 1 to omit intercept row
+sig.vars.df <- cbind(sig.vars.list, round(sig.vars.df,3))
+kable(sig.vars.df[order(abs(sig.vars.df$coef), decreasing = T),]) %>% kable_styling()
+```
+
+```{r warning=FALSE}
+## sort dataset by coefficient
+ci.df2 <- ci.df[order(ci.df$coef, decreasing = T),]
+# drop intercept from plot using [-1,] in data.frame ci.df (i.e., the intercept is the top row)
+plot(ci.df2[-1,1], ylim = c(min(ci.df2[-1,2]), max(ci.df2[-1,3])),
+     pch = 20, col = "darkgoldenrod2", ylab = "LASSO coefficient") + 
+  arrows(x0 = 1:(n - 1), y0 = ci.df2[-1,2], y1 = ci.df2[-1,3],
+         length = 0.02, angle = 90, code = 3, col = "grey") +
+  abline(h = 0, type = 2)
+```
+
+#### Plot only the significant variables
+There are `r length(sig.vars.list)` variables with CIs that don't overlap zero.
+```{r warning=FALSE}
+## sort dataset by coefficient
+sig.vars.df2 <- sig.vars.df[order(sig.vars.df$coef, decreasing = T),]
+opar <- par() 
+par(mar = c(15, 4, 1, 2))
+axis_labels <- gsub("_f....._2_0", "", sig.vars.df2[,1])
+plot(sig.vars.df2$coef, ylim = c(min(sig.vars.df2$l.ci),max(sig.vars.df2$u.ci)),
+     pch = 20, col = "darkgoldenrod2", ylab = "LASSO coefficient", xaxt = "n", xlab = "") + 
+  arrows(x0 = 1:dim(sig.vars.df2)[1], y0 = sig.vars.df2$l.ci, y1 = sig.vars.df2$u.ci,
+         length = 0.02, angle = 90, code = 3, col = "grey") +
+  abline(h = 0, type = 2)
+axis(side = 1, at = 1:length(sig.vars.list), labels = axis_labels, las = 2, cex.axis = 0.8)
+par(opar)
+```
+
+### Run model with only significant variables
+#### Top variables OLS
+```{r}
+top.ols <- lm(train_labels ~ .,
+          data = scaled.train_data[,sig.vars.index])
+top.ols.pred <- predict(object = top.ols, newdata = scaled.test_data[,sig.vars.index])
+
+test_results(top.ols.pred)
+```
+```{r}
+age_plot(top.ols.pred)
+```
+
+#### Top variables LASSO
+```{r}
+## fit model using optimal lambda value (1 SE value, not minimum)
+top.lasso.fit <- glmnet(x = x.train[,sig.vars.index], y = y.train,
+                    alpha = 1, family = "gaussian", lambda = lasso.fit.cv$lambda.1se)
+top.lasso.pred <- predict(top.lasso.fit, newx = as.matrix(scaled.test_data[,sig.vars.index]))
+test_results(top.lasso.pred)
+```
+```{r}
+age_plot(top.lasso.pred)
+```
+
+# Modality specific analysis
+#### Function to run all LASSO analyses
+Using the same training/test split as above, and using the same random seed.
+```{r}
+run_lasso <- function(list) {
+  train_data <- healthy.df[index == 1, list]
+  test_data <- healthy.df[index == 2,  list]
+  scaled.train_data <- as.data.frame(scale(train_data))
+  scaled.test_data <- as.data.frame(scale(test_data))
+  x.train <- as.matrix(scaled.train_data)
+  dimnames(x.train) <- NULL
+  y.train <- as.matrix(train_labels)
+  ## cross-validation for lambda
+  lasso.fit.cv <- cv.glmnet(x = x.train, y = y.train, alpha = 1, family = "gaussian")
+  lasso.fit <- glmnet(x = x.train, y = y.train, alpha = 1, family = "gaussian", lambda = lasso.fit.cv$lambda.1se)
+  lasso.pred <- predict(lasso.fit, newx = as.matrix(scaled.test_data))
+  dimnames(lasso.pred)[[2]] <- deparse(substitute(list))
+  # return(test_results(lasso.pred))
+  return(lasso.pred)
+}
+```
+
+### T1
+```{r}
+t1.vars.list <- grep("forced|nifti|discrepancy|t2_flair", grep("volume", names(df), value = T), invert = T, value = T)
+t1.pred <- run_lasso(t1.vars.list)
+test_results(t1.pred)
+```
+
+### T2
+Only one variable, just use OLS regression.
+```{r}
+t2.ols <- lm(train_labels ~ total_volume_of_white_matter_hyperintensities_from_t1_and_t2_flair_images_f25781_2_0,
+          data = scaled.train_data)
+t2.ols.pred <- predict(object = t2.ols, newdata = scaled.test_data)
+test_results(t2.ols.pred)
+```
+
+### T2-star
+```{r}
+t2star.vars.list <- grep("forced|nifti|discrepancy", grep("t2star", names(df), value = T), invert = T, value = T)
+t2star.pred <- run_lasso(t2star.vars.list)
+test_results(t2star.pred)
+```
+
+### Diffusion
+```{r}
+diffusion.vars.list <- grep("forced|nifti|discrepancy", grep("skeleton|tract", names(df), value = T), invert = T, value = T)
+diffusion.pred <- run_lasso(diffusion.vars.list)
+test_results(diffusion.pred)
+```
+
+### Task fMRI
+```{r}
+task.vars.list <- grep("forced|nifti|discrepancy", grep("bold|activation", names(df), value = T), invert = T, value = T)
+task.pred <- run_lasso(task.vars.list)
+test_results(task.pred)
+```
+
+### Resting-state fMRI
+```{r}
+rest.vars.list <- grep("forced|nifti|discrepancy", grep("Partial_corr_25_dim", names(df), value = T), invert = T, value = T)
+rest.pred <- run_lasso(rest.vars.list)
+test_results(rest.pred)
+```
+
+## Correlations across modalities
+```{r}
+pred.mat <- cbind(test_labels, t1.pred, t2.ols.pred, t2star.pred, diffusion.pred, task.pred, rest.pred)
+colnames(pred.mat) <- c("Age", "T1-weighted","T2-FLAIR","T2*","Diffusion","Task fMRI","Resting-state fMRI")
+# col1 <- colorRampPalette(brewer.pal(n = 10, name = "RdBu"))
+col1 <- colorRampPalette(colors = c("firebrick", "white", "dodgerblue"))
+cairo_pdf(filename = "~/Work/Articles/Brain age/UK Biobank multi-modal brain age/variable_corrplot.pdf")
+corrplot(cor(pred.mat), type = "upper", diag = T, method = "color", col = col1(100),
+         addCoef.col = "black", tl.col = "black")
+dev.off()
+corrplot(cor(pred.mat), type = "upper", diag = T, method = "color", col = col1(100),
+         addCoef.col = "black", tl.col = "black")
+```
+
+# Testing on non-healthy people
+Define non-healthy people as testing set.
+```{r paged.print=FALSE}
+non.healthy.df <- subset(df, df$healthy == "non-healthy")
+table(complete.cases(non.healthy.df[,imaging.vars.list]))
+describe(non.healthy.df$age_at_scan)
+describeBy(non.healthy.df$age_at_scan, non.healthy.df$sex)
+```
+
+Scale new subjects variables using the scaling parameters from the training set.
+```{r}
+scaled.non.healthy.test <- as.data.frame(scale(non.healthy.df[,imaging.vars.list], scaling.parameters.center, scaling.parameters.scale))
+lasso.non.healthy.pred <- as.numeric(predict(lasso.fit, newx = as.matrix(scaled.non.healthy.test)))
+```
+
+### Evaluate multi-modality brain-age model performance
+```{r}
+non.healthy.labels <- non.healthy.df$age_at_scan
+test_results2 <- function(pred, labels) {
+  r <- cor.test(labels, pred)$estimate
+  r.sq <- summary(lm(labels ~ pred))$r.squared
+  MAE <- mean(abs(pred - labels), na.rm = T)
+  age.bias <- cor.test(labels, (pred - labels))$estimate
+  value <- sapply(c(r,r.sq, MAE, age.bias), function(x) round(x, 3))
+  results <- cbind(c("r", "R^2", "MAE", "Age.bias"), value)
+  return(kable(results) %>% kable_styling())
+}
+test_results2(lasso.non.healthy.pred, non.healthy.labels)
+```
+
+### Brain-predicted age plot
+```{r}
+qplot(x = non.healthy.labels, y = lasso.non.healthy.pred) + 
+  geom_abline(slope = 1, intercept = 0) + geom_point(shape = 21, bg = "darkgoldenrod2", size = 2) +
+  geom_smooth(method = "lm", col = "grey") +
+  xlab("Age (years)") +
+  theme_bw()
+```
+
+## Correct for age bias
+Calculate age bias in initial test data.
+```{r}
+bias.model <- lm(lasso.pred ~ test_labels)
+bias.model$coefficients[1]
+bias.model$coefficients[2]
+```
+
+Apply correction to new (non-healthy) test data.
+Subtract the intercept and then divide by the slope
+```{r}
+lasso.non.healthy.pred.corrected <- (lasso.non.healthy.pred - bias.model$coefficients[1]) / bias.model$coefficients[2]
+test_results2(lasso.non.healthy.pred.corrected, non.healthy.labels)
+```
+
+### Age-bias corrected plot
+```{r}
+qplot(x = non.healthy.labels, y = lasso.non.healthy.pred.corrected) + 
+  geom_abline(slope = 1, intercept = 0) + geom_point(shape = 21, bg = "darkgoldenrod2", size = 2) +
+  geom_smooth(method = "lm", col = "grey") +
+  xlab("Age (years)") +
+  theme_bw()
+```
+
+##### Save plot for paper
+Using cowplot package
+```{r}
+plot1 <- qplot(x = non.healthy.labels, y = lasso.non.healthy.pred) +
+  geom_abline(slope = 1, intercept = 0) + geom_point(shape = 21, bg = "darkgoldenrod2", size = 2) +
+  geom_smooth(method = "lm", col = "grey") +
+  xlab("Age (years)") +
+  ylab("Brain-predicted age (years)") +
+  theme_bw()
+plot2 <- qplot(x = non.healthy.labels, y = lasso.non.healthy.pred.corrected)  +
+  geom_abline(slope = 1, intercept = 0) + geom_point(shape = 21, bg = "#0ebdee", size = 2) +
+  geom_smooth(method = "lm", col = "grey") +
+  xlab("Age (years)") +
+  ylab("Bias-adjusted brain-predicted age (years)") +
+  theme_bw()
+plot_grid(plot1, plot2, ncol = 2, labels = c("A", "B"))
+ggsave("~/Work/Articles/Brain age/UK Biobank multi-modal brain age/bias_correction_scatterplot.pdf", plot_grid(plot1, plot2, ncol = 2, labels = c("A", "B")), useDingbats = FALSE, dpi = 100, height = 4, width = 8)
+```
+
+### Brain-PAD: descriptive statistics
+Define brain-PAD and look at descriptives
+```{r paged.print=FALSE}
+non.healthy.df$brainPAD <- lasso.non.healthy.pred.corrected - non.healthy.df$age_at_scan
+describe(non.healthy.df$brainPAD)
+hist(non.healthy.df$brainPAD, breaks = 25, col = "darkgoldenrod2")
+```
+
+### Brain-PAD: evaluate potential covariates
+Decide what to use as covariates for brain-PAD
+```{r paged.print=FALSE}
+non.healthy.df$head_motion_tfmri <- non.healthy.df$mean_tfmri_head_motion_averaged_across_space_and_time_points_f25742_2_0
+m1 <- (lm(brainPAD ~ poly(age_at_scan, 2, raw = F) + 
+                    sex + 
+                    height_f12144_2_0 +
+                    volumetric_scaling_from_t1_head_image_to_standard_space_f25000_2_0 +
+                    head_motion_tfmri,
+                  data = non.healthy.df))
+summary(m1)
+lm.beta(m1)
+etasq(m1, partial = T)
+```
+
+### Hierachical partitioning of variance of covariates
+Used hier.part package to define unique (i.e., independent) variance and joint (i.e., shared) variance in brain-PAD.
+```{r paged.print=FALSE}
+hp.res <- hier.part(non.healthy.df$brainPAD, non.healthy.df[c("age_at_scan","sex", "height_f12144_2_0", "volumetric_scaling_from_t1_head_image_to_standard_space_f25000_2_0", "head_motion_tfmri")], gof = "Rsqu", barplot = F)
+round(hp.res$gfs,3)
+round(hp.res$IJ,3)
+round(hp.res$I.perc,3)
+```
+
+#### Barplot of unique and shared variance
+```{r}
+barplot(t(as.matrix(hp.res$IJ[,1:2])))
+```
+
+### Define function to run linear regression with required covariates
+P-values are corrected using FDR for 18 different comparisons.
+```{r paged.print=FALSE}
+run_lm <- function(var, data) {
+  m1 <- lm(brainPAD ~ data[[var]] +
+    poly(age_at_scan, 2, raw = F) +
+    sex +
+    height_f12144_2_0 +
+    volumetric_scaling_from_t1_head_image_to_standard_space_f25000_2_0 +
+    head_motion_tfmri,
+  data = data)
+  y <- round(summary(m1)$coefficients[2,],3)
+  z <- round(p.adjust(summary(m1)$coefficients[2,4], method = "fdr", n = 18),5)
+  names(z) <- "corrected_p"
+  part.eta <- round(etasq(m1, partial = T)[1,1],4)
+  names(part.eta) <- "partial eta^2"
+  return(c(y,z,part.eta))
+}
+```
+
+### Health parameters
+#### Cardiac
+```{r}
+run_lm("diastolic_blood_pressure_automated_reading_f4079_2_0", non.healthy.df)
+run_lm("systolic_blood_pressure_automated_reading_f4080_2_0", non.healthy.df)
+```
+
+#### Obesity
+```{r}
+run_lm("body_mass_index_bmi_f21001_2_0", non.healthy.df)
+run_lm("weight_f21002_2_0", non.healthy.df)
+run_lm("hip_circumference_f49_2_0", non.healthy.df)
+```
+
+#### Diabetes
+Do not know coded as -1, Prefer not to answer coded as -3. These values need to be excluded.
+```{r}
+with(subset(non.healthy.df, non.healthy.df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0 != -1 & non.healthy.df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0 != -3), table(diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0))
+
+run_lm("diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0", subset(non.healthy.df, non.healthy.df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0 != -1 & non.healthy.df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0 != -3))
+
+TukeyHSD(aov(brainPAD ~ diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0, data = subset(non.healthy.df, non.healthy.df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0 != -1 & non.healthy.df$diabetes_diagnosed_by_doctoruses_datacoding_100349_f2443_2_0 != -3)))
+```
+
+#### Stroke
+Question What was your age when the stroke was first diagnosed? recoded to be presence/absence of stroke history.
+Do not know coded as -1, Prefer not to answer coded as -3. These values need to be excluded.
+```{r}
+run_lm("stroke_history", non.healthy.df)
+
+TukeyHSD(aov(brainPAD ~ stroke_history, data = non.healthy.df))
+```
+
+#### Facial ageing
+Do not know coded as -1, Prefer not to answer coded as -3. These values need to be excluded.
+```{r paged.print=FALSE}
+with(subset(non.healthy.df, non.healthy.df$facial_ageinguses_datacoding_100435_f1757_2_0 > 0), table(facial_ageinguses_datacoding_100435_f1757_2_0))
+
+run_lm("facial_ageinguses_datacoding_100435_f1757_2_0", subset(non.healthy.df, non.healthy.df$facial_ageinguses_datacoding_100435_f1757_2_0 > 0))
+
+with(subset(non.healthy.df, non.healthy.df$facial_ageinguses_datacoding_100435_f1757_2_0 != -1 & non.healthy.df$facial_ageinguses_datacoding_100435_f1757_2_0 != -3), describeBy(brainPAD, as.factor(facial_ageinguses_datacoding_100435_f1757_2_0)))
+```
+
+### Smoking
+Prefer not to answer coded as -3. These values need to be excluded.
+```{r paged.print=FALSE}
+table(non.healthy.df$smoking_statususes_datacoding_90_f20116_2_0)
+with(subset(non.healthy.df, non.healthy.df$smoking_statususes_datacoding_90_f20116_2_0 != -3), table(smoking_statususes_datacoding_90_f20116_2_0))
+
+run_lm("smoking_statususes_datacoding_90_f20116_2_0", subset(non.healthy.df, non.healthy.df$smoking_statususes_datacoding_90_f20116_2_0 != -3))
+
+TukeyHSD(aov(brainPAD ~ smoking_statususes_datacoding_90_f20116_2_0, data = subset(non.healthy.df, non.healthy.df$smoking_statususes_datacoding_90_f20116_2_0 != -3)))
+ 
+with(subset(non.healthy.df, non.healthy.df$smoking_statususes_datacoding_90_f20116_2_0 != -3), describeBy(brainPAD, smoking_statususes_datacoding_90_f20116_2_0))
+```
+
+### Alcohol
+Prefer not to answer coded as -3. These values need to be excluded.
+```{r paged.print=FALSE}
+run_lm("alcohol_intake_frequencyuses_datacoding_100402_f1558_2_0", subset(non.healthy.df, non.healthy.df$alcohol_intake_frequencyuses_datacoding_100402_f1558_2_0 != -3))
+
+TukeyHSD(aov(brainPAD ~ alcohol_intake_frequencyuses_datacoding_100402_f1558_2_0, data = subset(non.healthy.df, non.healthy.df$alcohol_intake_frequencyuses_datacoding_100402_f1558_2_0 != -3)))
+
+with(subset(non.healthy.df, non.healthy.df$alcohol_intake_frequencyuses_datacoding_100402_f1558_2_0 != -3), describeBy(brainPAD, alcohol_intake_frequencyuses_datacoding_100402_f1558_2_0))
+```
+
+#### Physical activity
+Do not know coded as -1, Prefer not to answer coded as -3. These values need to be excluded.
+```{r}
+run_lm("duration_of_moderate_activityuses_datacoding_100291_f894_2_0", subset(non.healthy.df, non.healthy.df$duration_of_moderate_activityuses_datacoding_100291_f894_2_0 != -3 & non.healthy.df$duration_of_moderate_activityuses_datacoding_100291_f894_2_0 != -1))
+```
+
+```{r}
+run_lm("duration_of_vigorous_activityuses_datacoding_100291_f914_2_0", subset(non.healthy.df, non.healthy.df$duration_of_vigorous_activityuses_datacoding_100291_f914_2_0 != -3 & non.healthy.df$duration_of_vigorous_activityuses_datacoding_100291_f914_2_0 != -1))
+```
+
+### Cognitive performance
+Fluid intelligence, Trail-making task, Matrix pattern completion, Tower rearranging.
+```{r}
+run_lm("fluid_intelligence_score_f20016_2_0", non.healthy.df)
+
+## Trail making
+run_lm("duration_to_complete_numeric_path_trail_1uses_datacoding_1990_f6348_2_0", non.healthy.df)
+run_lm("duration_to_complete_alphanumeric_path_trail_2uses_datacoding_1990_f6350_2_0", non.healthy.df)
+
+## Matrix pattern completion
+run_lm("number_of_puzzles_correctly_solved_f6373_2_0", non.healthy.df)
+run_lm("duration_spent_answering_each_puzzle_f6333_2_0", non.healthy.df)
+
+## Tower rearranging
+run_lm("number_of_puzzles_correct_f6382_2_0", non.healthy.df)
+```
