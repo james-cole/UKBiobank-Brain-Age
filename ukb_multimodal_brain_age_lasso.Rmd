@@ -163,9 +163,8 @@ table(df$icd_positive)
 
 Check the diagnoses given to a random list of participants
 ```{r paged.print=FALSE}
-lapply(df[sample(1:length(df$eid), 2, replace = F),"eid"], function(x) ukb_icd_diagnosis(df, id = x, icd.version = 10))
+lapply(df[df$icd_positive == TRUE,"eid"][sample(1:length(which(df$icd_positive == TRUE)), 10)], function(x) ukb_icd_diagnosis(df, id = x, icd.version = 10))
 ```
-
 
 Check number of ICD-positive against subjective health and longstanding illness.
 ```{r}
