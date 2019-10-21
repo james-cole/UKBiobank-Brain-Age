@@ -113,7 +113,7 @@ df[,grep("bold", names(df))] <- lapply(df[,grep("bold", names(df))], as.numeric)
 df[,grep("skeleton", names(df))] <- lapply(df[,grep("skeleton", names(df))], as.numeric)
 df[,grep("tract", names(df))] <- lapply(df[,grep("tract", names(df))], as.numeric)
 df[,grep("activation", names(df))] <- lapply(df[,grep("activation", names(df))], as.numeric)
-write.csv(file = "ukb_imaging_vars_list.csv", x = imaging.vars.list, quote = F, row.names = F,col.names = F)
+write.csv(file = "ukb_imaging_vars_list.csv", x = imaging.vars.list, quote = F, row.names = F)
 ```
 
 ### The UK Biobank imaging visit is instance 2
@@ -160,6 +160,12 @@ names(has_icd.diagnosis.df) <- c("eid", "icd_positive")
 df <- merge(df, has_icd.diagnosis.df)
 table(df$icd_positive)
 ```
+
+Check the diagnoses given to a random list of participants
+```{r paged.print=FALSE}
+lapply(df[sample(1:length(df$eid), 2, replace = F),"eid"], function(x) ukb_icd_diagnosis(df, id = x, icd.version = 10))
+```
+
 
 Check number of ICD-positive against subjective health and longstanding illness.
 ```{r}
